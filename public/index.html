@@ -1,0 +1,151 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeshDrop</title><style>
+:root{color-scheme:light dark;font-family:system-ui,sans-serif}body{max-width:760px;margin:0 auto;padding:16px}
+.card{border:1px solid #8884;border-radius:10px;padding:12px;margin:12px 0}canvas{width:100%;border-radius:6px;background:#8882;margin:6px 0}
+button{padding:6px 12px;border-radius:6px;border:1px solid #8886;cursor:pointer}small{opacity:.7;word-break:break-all}
+.pill{padding:4px 12px;border-radius:99px;background:#8883}.ok{color:#2da44e}.row{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.peer{display:flex;gap:12px;align-items:center;background:#0e7c70;color:#fff;border-radius:10px;padding:10px 14px;margin:8px 0}.peer.cut{background:#7d2b2b}
+.ic{width:40px;height:40px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-size:22px}.b{background:#0005;border-radius:5px;padding:1px 7px;font-size:12px}
+</style></head><body>
+<h2>MeshDrop <small>offline large-file sharing</small></h2>
+<div class="card row" style="justify-content:flex-start;gap:24px"><div><small>You are:</small><br><b id="me">…</b></div><div style="border-left:2px solid #8885;padding-left:24px"><small>PIN:</small><br><b id="pin">…</b></div><div class="pill" id="conn" style="margin-left:auto">● Waiting for devices</div></div>
+<div class="card"><b>Connect another device</b><br><small>Scan this QR code, or open the full link, on the other device (same Wi-Fi).</small><br><img id="qr" width="160" height="160"><br><small id="link"></small></div>
+<div class="card"><b>Send</b><br><small>Choose one or more files. Every device in the room can send files too.</small><p><input type="file" id="f" multiple></p></div>
+<div class="card"><b>Live mesh map</b> <small>green dot = chunk straight from the sender · orange dot = relayed by another device · blue = you sending · red dashed = cut link</small><canvas id="mesh" width="720" height="260"></canvas></div>
+<h3>Transfers <small>(chunk colour: grey = missing, light → dark green = 1 → 3+ copies across devices)</small></h3><div id="files"><small>No transfers yet.</small></div>
+<div class="card"><b>Connected devices</b> <small>(Cut link = simulate out-of-range; chunks then relay via other devices)</small><div id="peers"></div></div>
+<div class="card"><small id="log"></small></div>
+<script>
+const $=s=>document.querySelector(s),CH=8<<20,FR=16384;
+const q=new URLSearchParams(location.search),room=q.get('room')||Math.random().toString(36).slice(2,8),secret=location.hash.slice(1)||crypto.randomUUID();
+history.replaceState(null,'','/?room='+room+'#'+secret);
+const peers={},infl=new Map(),files=new Map();let key,ws,me='',log=t=>$('#log').textContent=t;
+const A=['Energetic','Solid','Brave','Calm','Swift','Cheerful','Clever','Gentle','Lucky','Mighty','Quiet','Sunny'],F=['Banana','Blackberry','Mango','Papaya','Cherry','Guava','Lychee','Apricot','Coconut','Melon','Peach','Plum'],pk=a=>a[Math.random()*a.length|0];
+let myName,pin='----';try{myName=sessionStorage.getItem('mdname')}catch{}if(!myName){myName=pk(A)+' '+pk(F);try{sessionStorage.setItem('mdname',myName)}catch{}}
+const ua=navigator.userAgent,os=/iPhone|iPad|iPod/.test(ua)?'iOS':/Android/.test(ua)?'Android':/Windows/.test(ua)?'Windows':/Mac/.test(ua)?'macOS':/Linux/.test(ua)?'Linux':'Device',
+br=/Edg\//.test(ua)?'Edge':/OPR\//.test(ua)?'Opera':/Firefox\//.test(ua)?'Firefox':/Chrome\/|CriOS/.test(ua)?'Chrome':/Safari\//.test(ua)?'Safari':'Browser';
+const hid=s=>{let h=5381;for(const c of s)h=(h*33^c.charCodeAt(0))>>>0;return h.toString(36)+s.length.toString(36)};
+// ---- IndexedDB: chunks stored as "<fileId>|<index>", manifests as "m|<fileId>" ----
+const db=new Promise(r=>{const o=indexedDB.open('meshdrop',1);o.onupgradeneeded=()=>o.result.createObjectStore('c');o.onsuccess=()=>r(o.result)});
+const tx=async(m,f)=>{const d=await db;return new Promise((res,rej)=>{const r=f(d.transaction('c',m).objectStore('c'));r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})};
+const put=(k,v)=>tx('readwrite',s=>s.put(v,k)),get=k=>tx('readonly',s=>s.get(k));
+const keys=(a,b)=>tx('readonly',s=>s.getAllKeys(IDBKeyRange.bound(a,b))),vals=(a,b)=>tx('readonly',s=>s.getAll(IDBKeyRange.bound(a,b)));
+const sha=async b=>new Uint8Array(await crypto.subtle.digest('SHA-256',b));
+// ---- transfers ----
+async function addFile(m,file){let f=files.get(m.id);
+  if(f){if(file){f.file=file;f.mine=new Set([...Array(m.count).keys()])}return f}
+  f={m,file,mine:new Set(),src:{}};files.set(m.id,f);
+  if(file)f.mine=new Set([...Array(m.count).keys()]);
+  else{const ks=await keys(m.id+'|',m.id+'|\uffff');f.mine=new Set(ks.map(k=>+k.split('|')[1]));put('m|'+m.id,m)}
+  return f}
+// ---- transport: direct WebRTC channel, or (fallback) relay through the local server ----
+const ready=p=>p.dc?.readyState=='open'||p.rl;
+const raw=(p,d)=>{if(p.dc?.readyState=='open')return p.dc.send(d);
+  if(typeof d=='string')return ws.send(JSON.stringify({t:'r',to:p.id,d}));
+  const id=new TextEncoder().encode(p.id),f=new Uint8Array(1+id.length+d.byteLength);f[0]=id.length;f.set(id,1);f.set(new Uint8Array(d),1+id.length);ws.send(f)};
+const send=(p,m)=>ready(p)&&raw(p,JSON.stringify(m));
+const greet=p=>{send(p,{t:'hi',name:myName,os,br,pin});for(const f of files.values()){send(p,{t:'man',m:f.m});send(p,{t:'have',f:f.m.id,a:[...f.mine]})}ui()};
+const bcast=m=>Object.values(peers).forEach(p=>!p.blocked&&send(p,m));
+const sig=(to,d)=>ws.send(JSON.stringify({t:'sig',to,d}));
+const unlink=p=>{for(const[k,x]of infl)if(x===p)infl.delete(k);p.n=0;p.rx=null};
+function mkPeer(id,init){
+  const pc=new RTCPeerConnection({iceServers:/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname)?[]:[{urls:'stun:stun.l.google.com:19302'}]}),p=peers[id]={id,pc,have:{},n:0,bad:0,q:Promise.resolve()};
+  pc.onicecandidate=e=>e.candidate&&sig(id,{c:e.candidate});
+  const setup=dc=>{p.dc=dc;dc.binaryType='arraybuffer';dc.bufferedAmountLowThreshold=262144;
+    dc.onopen=()=>greet(p);
+    dc.onclose=()=>{unlink(p);delete peers[id];ui();pump()};dc.onmessage=e=>onMsg(p,e.data)};
+  if(init){setup(pc.createDataChannel('d'));pc.createOffer().then(o=>pc.setLocalDescription(o)).then(()=>sig(id,{s:pc.localDescription}))}
+  else pc.ondatachannel=e=>setup(e.channel);
+  // if the direct channel has not opened after 6 s, fall back to relaying through the server
+  setTimeout(()=>{if(peers[id]===p&&!ready(p)){p.rl=true;log('Direct link failed, using server relay for '+id);greet(p)}},6000);
+  return p}
+async function rec(fid,i){const r=await get(fid+'|'+i);if(r)return r;const f=files.get(fid);if(!f?.file)return;
+  const pt=await f.file.slice(i*CH,(i+1)*CH).arrayBuffer(),iv=crypto.getRandomValues(new Uint8Array(12));
+  return{iv,h:await sha(pt),ct:await crypto.subtle.encrypt({name:'AES-GCM',iv},key,pt)}}
+async function sendChunk(p,fid,i){const r=await rec(fid,i);if(!r||!ready(p))return;const n=r.ct.byteLength;
+  send(p,{t:'chunk',f:fid,i,n,iv:[...r.iv],h:[...r.h]});pulse(p.id,'out','#0969da');
+  for(let o=0;o<n;o+=FR){while((p.dc?.readyState=='open'?p.dc:ws).bufferedAmount>1<<20)await new Promise(x=>setTimeout(x,10));if(!ready(p))return;raw(p,r.ct.slice(o,o+FR))}}
+async function onMsg(p,d){
+  if(typeof d!='string'){const x=p.rx;if(!x||p.blocked)return;x.parts.push(d);x.got+=d.byteLength;p.bytes=(p.bytes||0)+d.byteLength;if(x.got>=x.m.n){p.rx=null;gotChunk(p,x.m,x.parts)}return}
+  const m=JSON.parse(d);
+  if(m.t=='hi'){Object.assign(p,{name:m.name,os:m.os,br:m.br,pin:m.pin});ui();return}
+  if(m.t=='blk'){p.blocked=m.v;unlink(p);ui();pump();return}
+  if(p.blocked)return;
+  if(m.t=='man'){const f=await addFile(m.m);bcast({t:'have',f:m.m.id,a:[...f.mine]});ui();pump()}
+  else if(m.t=='have'){p.have[m.f]=new Set(m.a);pump()}
+  else if(m.t=='has'){(p.have[m.f]??=new Set()).add(m.i);pump()}
+  else if(m.t=='req')p.q=p.q.then(()=>sendChunk(p,m.f,m.i));
+  else if(m.t=='chunk')p.rx={m,parts:[],got:0}}
+async function gotChunk(p,m,parts){const fid=m.f,i=m.i,f=files.get(fid);infl.delete(fid+'|'+i);p.n--;if(!f)return;
+  try{const ct=await new Blob(parts).arrayBuffer(),iv=new Uint8Array(m.iv),h=new Uint8Array(m.h);
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv},key,ct);
+    if((await sha(pt)).some((b,k)=>b!==h[k]))throw 0;
+    await put(fid+'|'+i,{iv,h,ct});f.mine.add(i);f.src[p.name||p.id]=(f.src[p.name||p.id]||0)+1;pulse(p.id,'in',(p.name||p.id)==f.m.from?'#2da44e':'#fb8500');bcast({t:'has',f:fid,i})}
+  catch{p.bad++;log('Rejected chunk '+i+' from '+p.id+' (check both devices use the same full link)')}
+  ui();pump()}
+function pump(){for(const p of Object.values(peers)){if(p.blocked||p.bad>=3||!ready(p))continue;
+  for(const f of files.values()){const h=p.have[f.m.id];if(!h||f.mine.size==f.m.count)continue;
+    for(const i of h){if(p.n>=4)break;const k=f.m.id+'|'+i;if(!f.mine.has(i)&&!infl.has(k)){infl.set(k,p);p.n++;send(p,{t:'req',f:f.m.id,i})}}}}}
+// ---- UI ----
+const mb=n=>(n/1e6).toFixed(n<1e7?1:0)+' MB';
+function ui(){
+  const open=Object.values(peers).filter(ready).length,tot=Object.values(peers).reduce((a,p)=>a+(p.rate||0),0);
+  $('#conn').innerHTML=open?`<span class="ok">●</span> Connected to ${open} device${open>1?'s':''}`:'● Waiting for devices';
+  if(files.size)$('#files>small')?.remove();
+  for(const f of files.values()){const m=f.m;
+    if(!f.el){f.el=document.createElement('div');f.el.className='card';f.el.innerHTML=`<b></b><div class="meta"></div><canvas width="720" height="20"></canvas><small class="src"></small><br><small class="res"></small><p><button hidden data-f="${m.id}">Save file</button></p>`;$('#files').prepend(f.el)}
+    const own=!!f.file,done=f.mine.size==m.count;
+    f.el.querySelector('b').textContent=m.name;
+    f.el.querySelector('.meta').textContent=`${own?'Sent by you':'Sent by '+m.from} · ${mb(m.size)} · ${own?'available to '+open+' device'+(open==1?'':'s'):`${f.mine.size}/${m.count} chunks (${Math.round(100*f.mine.size/m.count)}%)${done?' — complete!':''}${!done&&tot>0?` · ${(tot/1e6).toFixed(1)} MB/s · ~${Math.ceil((m.count-f.mine.size)*CH/tot)}s left`:''}`}`;
+    f.el.querySelector('.src').textContent=own?'':'Chunks delivered by: '+(Object.entries(f.src).map(([k,v])=>`${k} (${v})`).join(', ')||'—');
+    f.el.querySelector('button').hidden=!(done&&!own);
+    const c=f.el.querySelector('canvas'),x=c.getContext('2d'),cols=Math.floor(c.width/10),rows=Math.max(1,Math.ceil(m.count/cols));
+    const live=Object.values(peers).filter(p=>!p.blocked&&ready(p));let min=1e9;c.height=rows*10;
+    for(let i=0;i<m.count;i++){const n=(f.mine.has(i)?1:0)+live.filter(p=>p.have[m.id]?.has(i)).length;min=Math.min(min,n);x.fillStyle=['#8886','#9be9a8','#40c463','#216e39'][Math.min(n,3)];x.fillRect(i%cols*10,Math.floor(i/cols)*10,8,8)}
+    f.el.querySelector('.res').textContent=min>=2?'✔ Resilient: every chunk is on 2+ devices, so any one device can leave':min==1?'● Every chunk exists on a reachable device, but some have only one copy':'○ Some chunks are not on any reachable device yet'}
+  $('#peers').innerHTML=Object.values(peers).map(p=>`<div class="peer${p.blocked?' cut':''}"><div class="ic">${/iOS|Android/.test(p.os)?'📱':'💻'}</div><div style="flex:1"><div style="font-size:18px">${p.name||'Device '+p.id}</div><span class="b">${p.os||'?'} • ${p.br||'?'}</span> <span class="b">${p.dc?.readyState=='open'?'WebRTC direct':p.rl?'via server relay':'connecting…'}</span> <span class="b">↓ ${((p.rate||0)/1e6).toFixed(1)} MB/s</span> <span class="b">${Object.values(p.have).reduce((a,s)=>a+s.size,0)} chunks</span> <span class="b">${p.blocked?'link cut':ready(p)?'linked':'connecting'}</span>${p.pin&&p.pin!=pin?' <span class="b" style="background:#d1242f">⚠ different PIN: not the same link</span>':''}</div><button data-id="${p.id}">${p.blocked?'Restore':'Cut'} link</button></div>`).join('')||'<small>No devices connected yet</small>'}
+$('#peers').onclick=e=>{const p=peers[e.target.dataset.id];if(!p)return;const v=!p.blocked;send(p,{t:'blk',v});p.blocked=v;unlink(p);ui();pump()};
+$('#f').onchange=async e=>{for(const file of e.target.files){
+  const m={id:hid(file.name+'|'+file.size+'|'+file.lastModified),name:file.name,size:file.size,count:Math.max(1,Math.ceil(file.size/CH)),from:myName};
+  const f=await addFile(m,file);bcast({t:'man',m:f.m});bcast({t:'have',f:m.id,a:[...f.mine]})}
+  e.target.value='';ui()};
+$('#files').onclick=async e=>{const f=files.get(e.target.dataset.f);if(!f)return;const parts=[];
+  for(let i=0;i<f.m.count;i++){const r=await get(f.m.id+'|'+i);parts.push(await crypto.subtle.decrypt({name:'AES-GCM',iv:r.iv},key,r.ct))}
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(parts));a.download=f.m.name;a.click()};
+// ---- live mesh map + speed/ETA ----
+const pulses=[],pulse=(id,dir,col)=>{if(pulses.length<200)pulses.push({id,dir,col,t:0})};
+setInterval(()=>{let any=false;for(const p of Object.values(peers)){const d=(p.bytes||0)-(p.last||0);p.last=p.bytes||0;p.rate=.5*(p.rate||0)+.5*d}
+  for(const f of files.values())if(f.mine.size<f.m.count)any=true;if(any)ui()},1000);
+function drawMesh(){
+  const c=$('#mesh'),x=c.getContext('2d'),W=c.width,H=c.height,cx=W/2,cy=H/2,ps=Object.values(peers),pos={};
+  const fg=matchMedia('(prefers-color-scheme: dark)').matches?'#ddd':'#222';
+  x.clearRect(0,0,W,H);x.textAlign='center';x.font='13px system-ui';
+  ps.forEach((p,k)=>{const a=2*Math.PI*k/ps.length-Math.PI/2;pos[p.id]=[cx+Math.cos(a)*(W/2-90),cy+Math.sin(a)*(H/2-45)]});
+  for(const p of ps){const[px,py]=pos[p.id];x.setLineDash(p.blocked?[6,6]:[]);x.strokeStyle=p.blocked?'#d1242f':'#8888';x.lineWidth=2;x.beginPath();x.moveTo(cx,cy);x.lineTo(px,py);x.stroke()}
+  x.setLineDash([]);
+  for(let k=pulses.length-1;k>=0;k--){const u=pulses[k],P=pos[u.id];if(!P||(u.t+=.025)>1){pulses.splice(k,1);continue}
+    const s=u.dir=='in'?[P,[cx,cy]]:[[cx,cy],P];x.fillStyle=u.col;x.beginPath();
+    x.arc(s[0][0]+(s[1][0]-s[0][0])*u.t,s[0][1]+(s[1][1]-s[0][1])*u.t,6,0,7);x.fill()}
+  const node=(X,Y,r,col,t,sub)=>{x.fillStyle=col;x.beginPath();x.arc(X,Y,r,0,7);x.fill();x.fillStyle='#fff';x.fillText(t,X,Y+4);if(sub){x.fillStyle=fg;x.fillText(sub,X,Y+r+14)}};
+  node(cx,cy,24,'#0969da','You',myName);
+  for(const p of ps)node(pos[p.id][0],pos[p.id][1],20,p.blocked?'#d1242f':'#2da44e',(p.name||p.id)[0],(p.name||p.id)+' · '+((p.rate||0)/1e6).toFixed(1)+' MB/s');
+  requestAnimationFrame(drawMesh)}
+drawMesh();
+// ---- boot ----
+(async()=>{
+  key=await crypto.subtle.importKey('raw',await sha(new TextEncoder().encode(secret)),'AES-GCM',false,['encrypt','decrypt']);
+  const hh=await sha(new TextEncoder().encode('pin'+secret));pin=String((hh[0]<<8|hh[1])%10000).padStart(4,'0');$('#pin').textContent=pin;$('#me').textContent=myName;
+  for(const m of await vals('m|','m|\uffff'))await addFile(m);   // resume: restore earlier transfers and the chunks already held
+  const link=`${location.origin}/?room=${room}#${secret}`;
+  $('#link').textContent=link;$('#qr').src='/qr?u='+encodeURIComponent(link);ui();
+  ws=new WebSocket('wss://'+location.host+'/ws?room='+room);ws.binaryType='arraybuffer';
+  ws.onmessage=async e=>{
+    if(typeof e.data!='string'){const u=new Uint8Array(e.data),L=u[0],p=peers[new TextDecoder().decode(u.slice(1,1+L))];if(p){p.rl=true;onMsg(p,e.data.slice(1+L))}return}
+    const m=JSON.parse(e.data);
+    if(m.t=='r'){const p=peers[m.from];if(p){p.rl=true;onMsg(p,m.d)}return}
+    if(m.t=='left'){const p=peers[m.id];if(p&&p.dc?.readyState!='open'){unlink(p);delete peers[m.id];ui();pump()}return}
+    if(m.t=='hello'){me=m.id;m.peers.forEach(id=>mkPeer(id,true))}
+    else if(m.t=='sig'){const p=peers[m.from]||mkPeer(m.from,false),d=m.d;
+      if(d.s){await p.pc.setRemoteDescription(d.s);if(d.s.type=='offer'){await p.pc.setLocalDescription(await p.pc.createAnswer());sig(m.from,{s:p.pc.localDescription})}}
+      else if(d.c)await p.pc.addIceCandidate(d.c)}}})();
+</script></body></html>
